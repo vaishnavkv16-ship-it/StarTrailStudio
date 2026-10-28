@@ -1,0 +1,22 @@
+name: Build Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: >
+          pyinstaller --noconfirm --onefile --windowed --name StarTrailStudio
+          --collect-all rawpy --collect-all pillow_heif --collect-all imageio_ffmpeg
+          --exclude-module tkinter launcher.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StarTrailStudio-windows
+          path: dist/StarTrailStudio.exe
