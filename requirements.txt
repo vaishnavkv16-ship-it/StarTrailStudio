@@ -1,0 +1,8 @@
+numpy
+opencv-python
+rawpy
+pillow
+pillow-heif
+imageio-ffmpeg
+PySide6
+pyinstaller
