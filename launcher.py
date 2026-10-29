@@ -188,6 +188,97 @@ def _fit_size(img, size):
     return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
 
+# ===== hot-pixel and noise cleanup =====
+import warnings
+
+
+class HotPixelFixer:
+    """Repairs known hot pixels by replacing them with the median of their clean neighbours."""
+
+    def __init__(self, mask):
+        self.shape = mask.shape
+        self.ys, self.xs = np.nonzero(mask)
+        r = 3
+        offs = np.array([(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1) if (dy, dx) != (0, 0)])
+        h, w = mask.shape
+        self.iy = np.clip(self.ys[:, None] + offs[None, :, 0], 0, h - 1)
+        self.ix = np.clip(self.xs[:, None] + offs[None, :, 1], 0, w - 1)
+        self.valid = ~mask[self.iy, self.ix]
+
+    @property
+    def count(self):
+        return int(len(self.ys))
+
+    def apply(self, img):
+        if img.shape[:2] != self.shape or self.count == 0:
+            return img
+        out = img.copy()
+        step = 50000
+        for a in range(0, self.count, step):
+            sl = slice(a, a + step)
+            vals = img[self.iy[sl], self.ix[sl]].astype(np.float32)      # (N, 48, 3)
+            vals[~self.valid[sl]] = np.nan
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                repl = np.nanmedian(vals, axis=1)
+            ok = ~np.isnan(repl).any(axis=1)
+            out[self.ys[sl][ok], self.xs[sl][ok]] = np.clip(repl[ok], 0, 65535).astype(np.uint16)
+        return out
+
+
+def build_hot_pixel_fixer(files, sensitivity=5, samples=12, progress=_noop, cancel=_never):
+    """
+    Hot pixels stay on the same sensor pixel while stars drift, so a spot that is bright
+    compared with its surroundings in most sampled frames (and is tiny) is a hot pixel.
+    Returns a HotPixelFixer, or None if there are too few photos to tell.
+    """
+    if len(files) < 3:
+        return None
+    idx = np.unique(np.linspace(0, len(files) - 1, min(samples, len(files))).astype(int))
+    thr = max(6, 22 - 2 * sensitivity) * 257
+    counts = None
+    for j, i in enumerate(idx):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(j, len(idx), f"Looking for hot pixels {j+1}/{len(idx)}")
+        ch = load_image(files[i]).max(axis=2)
+        hot = (ch.astype(np.int32) - cv2.medianBlur(ch, 5).astype(np.int32)) > thr
+        if counts is None:
+            counts = hot.astype(np.uint16)
+        elif hot.shape == counts.shape:
+            counts += hot
+    need = max(2, int(np.ceil(0.6 * len(idx))))
+    mask = (counts >= need).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    small = np.zeros(num, bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] <= 12          # tiny spots only (not lamps)
+    mask = cv2.dilate(small[labels].astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    fixer = HotPixelFixer(mask)
+    return fixer if fixer.count else None
+
+
+def denoise_frame(img16, level):
+    """level 0 off | 1 light (colour noise) | 2 medium | 3 strong (adds edge-preserving brightness denoise).
+    Colour noise is smoothed at reduced resolution (fast); brightness detail is kept sharp."""
+    if level <= 0:
+        return img16
+    y, cr, cb = cv2.split(cv2.cvtColor(img16, cv2.COLOR_RGB2YCrCb))
+    h, w = y.shape
+    k = 4 if max(h, w) >= 1600 else 2
+    sig = {1: 1.5, 2: 2.5, 3: 3.5}[level] / k
+
+    def smooth(c):
+        small = cv2.resize(c, (max(1, w // k), max(1, h // k)), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), sig)
+        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    cr, cb = smooth(cr), smooth(cb)
+    if level >= 2:
+        strength = {2: 2.0, 3: 5.0}[level] * 257
+        search = {2: 11, 3: 15}[level]
+        y = cv2.fastNlMeansDenoising(y, [strength], None, 5, search, cv2.NORM_L1)
+    return cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2RGB)
+
+
 class TrailAccumulator:
     """Running star-trail stack. mode: 'lighten' (trails stay) or 'comet' (trails fade)."""
 
@@ -217,17 +308,22 @@ class TrailAccumulator:
 
 # ---------------------------------------------------------------- star trails
 def stack_star_trails(files, mode="lighten", comet_length=0.5, gap_fill=False,
+                      hot_pixels=False, hot_sensitivity=5, denoise=0,
                       progress=_noop, cancel=_never):
     """Stack all frames into one image. Streams one frame at a time (low memory)."""
     if not files:
         raise ValueError("No images selected")
+    fixer = build_hot_pixel_fixer(files, hot_sensitivity, progress=progress, cancel=cancel) if hot_pixels else None
     acc = TrailAccumulator(mode, comet_length, gap_fill)
     n = len(files)
     for i, f in enumerate(files):
         if cancel():
             raise InterruptedError("Cancelled")
         progress(i, n, f"Stacking {os.path.basename(f)}")
-        acc.add(load_image(f))
+        img = load_image(f)
+        if fixer is not None:
+            img = fixer.apply(img)
+        acc.add(denoise_frame(img, denoise))
     progress(n, n, "Done")
     return acc.acc
 
@@ -269,7 +365,9 @@ def _has_encoder(ffmpeg, name):
 
 def render_timelapse(files, out_path, fps=24.0, size=None, deflicker=False, deflicker_window=7,
                      fmt="mp4", trail_mode=None, comet_length=0.6, gap_fill=False,
-                     hold_seconds=0.0, progress=_noop, cancel=_never):
+                     hold_seconds=0.0, meteors=None, meteor_persist=2.0, meteor_mark=False,
+                     hot_pixels=False, hot_sensitivity=5, denoise=0,
+                     progress=_noop, cancel=_never):
     """
     fmt: "mp4" (H.264, high quality) | "avi_raw" (uncompressed 8-bit AVI) | "tiff_seq" (16-bit TIFF folder)
     trail_mode: None = normal timelapse
@@ -283,6 +381,7 @@ def render_timelapse(files, out_path, fps=24.0, size=None, deflicker=False, defl
     if deflicker and trail_mode is None:
         gains = compute_deflicker_gains(files, deflicker_window, progress, cancel)
 
+    fixer = build_hot_pixel_fixer(files, hot_sensitivity, progress=progress, cancel=cancel) if hot_pixels else None
     first = load_image(files[0])
     if size is None:
         size = (first.shape[1], first.shape[0])
@@ -333,17 +432,46 @@ def render_timelapse(files, out_path, fps=24.0, size=None, deflicker=False, defl
     acc = TrailAccumulator(trail_mode, comet_length, gap_fill) if trail_mode else None
     n = len(files)
     last = None
+    by_path = meteors["by_path"] if meteors else {}
+    det_size = meteors["det_size"] if meteors else None
+    glow = None
+    marks = []                                    # (last_frame_index, center, radius)
+    decay = 0.03 ** (1.0 / max(1.0, meteor_persist * fps)) if meteor_persist > 0 else 0.0
     try:
         for i, f in enumerate(files):
             if cancel():
                 raise InterruptedError("Cancelled")
             progress(i, n, f"Rendering frame {i+1}/{n}")
             img = first if i == 0 else load_image(f)
+            if fixer is not None:
+                img = fixer.apply(img)              # repair hot pixels at full resolution first
             img = _fit_size(img, size)
+            img = denoise_frame(img, denoise)
+            if gains is not None:
+                img = np.clip(img.astype(np.float32) * gains[i], 0, 65535).astype(np.uint16)
+            raw = img
             if acc is not None:
                 img = acc.add(img)
-            elif gains is not None:
-                img = np.clip(img.astype(np.float32) * gains[i], 0, 65535).astype(np.uint16)
+            if meteors:
+                if glow is not None:
+                    glow = glow * decay
+                evs = by_path.get(f)
+                if evs:
+                    m = _event_mask(evs, det_size, size)
+                    contrib = raw.astype(np.float32) * m
+                    glow = contrib if glow is None else np.maximum(glow, contrib)
+                    for e in evs:
+                        sx = size[0] / det_size[0]
+                        marks.append((i + max(1, int(fps)), (int(e["center"][0] * sx), int(e["center"][1] * sx)),
+                                      int(e["length"] * sx * 0.7) + 25))
+                if glow is not None:
+                    img = np.maximum(img, np.clip(glow, 0, 65535).astype(np.uint16))
+                if meteor_mark:
+                    marks = [mk for mk in marks if mk[0] > i]
+                    if marks:
+                        img = img.copy()
+                        for _, ctr, rad in marks:
+                            cv2.circle(img, ctr, rad, (65535, 54000, 15000), max(2, size[0] // 600), cv2.LINE_AA)
             write(img, i + 1)
             last = img
         if proc is not None and hold_seconds > 0 and last is not None:
@@ -366,6 +494,160 @@ def render_timelapse(files, out_path, fps=24.0, size=None, deflicker=False, defl
             errlog.close()
     progress(n, n, "Done")
     return out_path
+
+
+# ===== meteor detection =====
+import shutil
+
+
+def _meteor_gray(path, max_side=1600):
+    ext = os.path.splitext(path)[1].lower()
+    img = load_image(path, half_size=(ext in RAW_EXT))
+    g = cv2.cvtColor((img >> 8).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    h, w = g.shape
+    sc = max_side / max(h, w)
+    if sc < 1:
+        g = cv2.resize(g, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(g, (0, 0), 1.0)
+
+
+def _angle_diff(a, b):
+    d = abs(a - b) % 180
+    return min(d, 180 - d)
+
+
+def detect_meteors(files, sensitivity=5, min_length=30, ignore_satellites=True,
+                   progress=_noop, cancel=_never):
+    """
+    Finds short bright streaks that appear in one or two frames.
+    sensitivity 1..10 (higher finds fainter meteors, but more false hits)
+    min_length: shortest streak, in pixels at 1600 px image width
+    ignore_satellites: drop streaks that continue over 3+ consecutive frames (planes, satellites)
+    Returns {"events": [...], "rejected": int, "det_size": (w, h), "n": int}
+    """
+    n = len(files)
+    if n < 2:
+        raise ValueError("Need at least 2 photos to look for meteors")
+    thr = max(8, 46 - 4 * sensitivity)
+    k5 = np.ones((5, 5), np.uint8)
+    cands = []
+    prev_g, cur_g, next_g = None, _meteor_gray(files[0]), _meteor_gray(files[1])
+    det_size = (cur_g.shape[1], cur_g.shape[0])
+    diag = (det_size[0] ** 2 + det_size[1] ** 2) ** 0.5
+    for i in range(n):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(i, n, f"Looking for meteors {i+1}/{n}")
+        refs = [g for g in (prev_g, next_g) if g is not None]
+        ref = cv2.dilate(refs[0] if len(refs) == 1 else np.maximum(refs[0], refs[1]), k5)
+        mask = (cv2.subtract(cur_g, ref) > thr).astype(np.uint8)
+        if 0 < mask.sum() and mask.mean() < 0.04:       # skip global flashes (clouds, headlights)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            for k in range(1, num):
+                if stats[k, cv2.CC_STAT_AREA] < 6:
+                    continue
+                x, y, w, h = [int(v) for v in stats[k, :4]]
+                comp = labels[y:y + h, x:x + w] == k
+                ys, xs = np.nonzero(comp)
+                pts = np.column_stack([xs + x, ys + y]).astype(np.float32)
+                (cx, cy), (rw, rh), ang = cv2.minAreaRect(pts)
+                long_, short_ = max(rw, rh), max(min(rw, rh), 1.0)
+                if long_ < min_length or long_ / short_ < 3.5:
+                    continue
+                ang = (ang if rw >= rh else ang + 90) % 180
+                cands.append(dict(frame=i, path=files[i], length=float(long_), angle=float(ang),
+                                  center=(float(cx), float(cy)), bbox=(x, y, w, h),
+                                  patch=comp.astype(np.uint8)))
+        prev_g, cur_g = cur_g, next_g
+        next_g = _meteor_gray(files[i + 2]) if i + 2 < n else None
+
+    rejected = 0
+    if ignore_satellites and cands:
+        parent = list(range(len(cands)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        by_frame = {}
+        for idx, c in enumerate(cands):
+            by_frame.setdefault(c["frame"], []).append(idx)
+        for idx, c in enumerate(cands):
+            for pj in by_frame.get(c["frame"] - 1, []):
+                p = cands[pj]
+                d = ((c["center"][0] - p["center"][0]) ** 2 + (c["center"][1] - p["center"][1]) ** 2) ** 0.5
+                if _angle_diff(c["angle"], p["angle"]) < 20 and d < 0.35 * diag:
+                    parent[find(idx)] = find(pj)
+        sizes = {}
+        for idx in range(len(cands)):
+            sizes[find(idx)] = sizes.get(find(idx), 0) + 1
+        kept = [c for idx, c in enumerate(cands) if sizes[find(idx)] < 3]
+        rejected = len(cands) - len(kept)
+        cands = kept
+    progress(n, n, "Done")
+    return {"events": cands, "rejected": rejected, "det_size": det_size, "n": n}
+
+
+def _event_mask(evs, det_size, out_size):
+    """Soft 0..1 mask (H, W, 1) of the meteor streaks of one frame at output size."""
+    dw, dh = det_size
+    ow, oh = out_size
+    m = np.zeros((dh, dw), np.uint8)
+    for e in evs:
+        x, y, w, h = e["bbox"]
+        m[y:y + h, x:x + w] |= e["patch"]
+    m = cv2.resize(m * 255, (ow, oh), interpolation=cv2.INTER_LINEAR)
+    k = max(3, int(round(2.5 * ow / dw)) * 2 + 1)
+    m = cv2.dilate(m, np.ones((k, k), np.uint8))
+    m = cv2.GaussianBlur(m, (0, 0), max(1.0, k / 3))
+    return (m.astype(np.float32) / 255.0)[..., None]
+
+
+def _group_by_path(events):
+    by = {}
+    for e in events:
+        by.setdefault(e["path"], []).append(e)
+    return by
+
+
+def make_meteor_composite(files, events, det_size, progress=_noop, cancel=_never):
+    """One sky photo (middle frame) with every detected meteor added on top (full resolution)."""
+    if not events:
+        raise ValueError("No meteors to combine - run 'Find meteors' first")
+    out = load_image(files[len(files) // 2])
+    h, w = out.shape[:2]
+    by = _group_by_path(events)
+    for j, (p, evs) in enumerate(by.items()):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(j, len(by), f"Adding meteor {j+1}/{len(by)}")
+        fr = load_image(p)
+        if fr.shape[:2] != (h, w):
+            fr = cv2.resize(fr, (w, h), interpolation=cv2.INTER_AREA)
+        m = _event_mask(evs, det_size, (w, h))
+        out = np.maximum(out, np.clip(fr.astype(np.float32) * m, 0, 65535).astype(np.uint16))
+    progress(len(by), len(by), "Done")
+    return out
+
+
+def export_meteor_frames(files, events, folder, progress=_noop, cancel=_never):
+    """Copy the original photos that contain meteors into a folder and write meteors.csv."""
+    os.makedirs(folder, exist_ok=True)
+    by = _group_by_path(events)
+    rows = ["file,streak_length_px,angle_deg"]
+    for j, (p, evs) in enumerate(sorted(by.items(), key=lambda kv: natural_key(kv[0]))):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(j, len(by), f"Copying {os.path.basename(p)}")
+        shutil.copy2(p, os.path.join(folder, os.path.basename(p)))
+        for e in evs:
+            rows.append(f'"{os.path.basename(p)}",{e["length"]:.0f},{e["angle"]:.0f}')
+    with open(os.path.join(folder, "meteors.csv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(rows) + "\n")
+    progress(len(by), len(by), "Done")
+    return folder
 
 
 # ===== starry sky art (generated in code, no image files needed) =====
@@ -466,7 +748,7 @@ QComboBox, QDoubleSpinBox, QSpinBox { background:#111a40; border:1px solid #2f3f
                                       padding:5px 8px; min-height:18px; }
 QComboBox QAbstractItemView { background:#111a40; selection-background-color:#24357a; border:1px solid #2f3f85; }
 QTabWidget::pane { border:1px solid #243060; border-radius:10px; top:-1px; }
-QTabBar::tab { background:#111a40; padding:9px 16px; border-top-left-radius:8px; border-top-right-radius:8px;
+QTabBar::tab { background:#111a40; padding:9px 12px; border-top-left-radius:8px; border-top-right-radius:8px;
                margin-right:3px; color:#9aa6d6; }
 QTabBar::tab:selected { background:#1f2d6b; color:#ffd88a; font-weight:bold; }
 QProgressBar { border:1px solid #2f3f85; border-radius:8px; text-align:center; background:#0d1431;
@@ -595,15 +877,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ================= right: create =================
         tabs = QtWidgets.QTabWidget()
+        tabs.setUsesScrollButtons(False)
 
         def note(text):
             l = QtWidgets.QLabel(text); l.setObjectName("muted"); l.setWordWrap(True); return l
 
-        def slider_row(sl):
-            lbl = QtWidgets.QLabel(f"{sl.value()}%"); lbl.setFixedWidth(42)
-            sl.valueChanged.connect(lambda v: lbl.setText(f"{v}%"))
+        def slider_row(sl, fmt="{}%"):
+            lbl = QtWidgets.QLabel(fmt.format(sl.value())); lbl.setFixedWidth(42)
+            sl.valueChanged.connect(lambda v: lbl.setText(fmt.format(v)))
             row = QtWidgets.QHBoxLayout(); row.addWidget(sl, 1); row.addWidget(lbl)
             return row
+
+        def cleanup_widgets():
+            hot = QtWidgets.QCheckBox("Remove hot pixels")
+            hot.setToolTip("Finds pixels that stay bright in the same spot in your photos and repairs them.\n"
+                           "Stops dotted lines in star trails and fixed bright dots in videos.")
+            nr = QtWidgets.QComboBox(); nr.addItems(["Off", "Light (fast)", "Medium", "Strong (slower)"])
+            nr.setToolTip("Light: removes colour speckle (fast).\nMedium/Strong: also smooth brightness noise - slower.\n"
+                          "In timelapse it runs after resizing, so choosing a smaller video size is much faster.")
+            return hot, nr
+        self.hot_cb, self.nr_cb = cleanup_widgets()
+        self.hot_cb2, self.nr_cb2 = cleanup_widgets()
+        self.hot_cb.toggled.connect(self.hot_cb2.setChecked); self.hot_cb2.toggled.connect(self.hot_cb.setChecked)
+        self.nr_cb.currentIndexChanged.connect(self.nr_cb2.setCurrentIndex)
+        self.nr_cb2.currentIndexChanged.connect(self.nr_cb.setCurrentIndex)
 
         st = QtWidgets.QWidget(); f = QtWidgets.QFormLayout(st)
         f.setVerticalSpacing(10)
@@ -618,8 +915,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_trail = QtWidgets.QPushButton("✨  Create star trail image"); self.b_trail.setObjectName("primary")
         self.b_trail.clicked.connect(self.run_trails)
         f.addRow("Style", self.mode); f.addRow("Comet length", slider_row(self.comet)); f.addRow("", self.gap)
+        f.addRow("", self.hot_cb); f.addRow("Noise reduction", self.nr_cb)
         f.addRow("Save as", self.st_fmt); f.addRow(self.b_trail)
-        tabs.addTab(st, "⭐  Star trail image")
+        tabs.addTab(st, "⭐ Trails")
 
         tl = QtWidgets.QWidget(); g = QtWidgets.QFormLayout(tl)
         g.setVerticalSpacing(10)
@@ -633,18 +931,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hold.setToolTip("Keep the finished trail on screen at the end of the video")
         self.fps = QtWidgets.QDoubleSpinBox(); self.fps.setRange(1, 120); self.fps.setValue(24); self.fps.setSuffix(" fps")
         self.res = QtWidgets.QComboBox(); self.res.addItems(["Original size", "3840 x 2160 (4K)", "1920 x 1080 (Full HD)", "1280 x 720 (HD)"])
-        self.defl = QtWidgets.QCheckBox("Deflicker (smooth brightness changes)")
+        self.defl = QtWidgets.QCheckBox("Deflicker")
         self.defl_w = QtWidgets.QSpinBox(); self.defl_w.setRange(3, 51); self.defl_w.setValue(7)
+        self.defl.setToolTip("Smooths brightness changes between frames (normal timelapse only)")
         self.tl_fmt = QtWidgets.QComboBox(); self.tl_fmt.addItems(TL_FORMATS)
         self.warn = note("MP4 files are small. Uncompressed AVI/TIFF are huge (1080p ≈ 6 MB per frame, 4K ≈ 25 MB).")
         self.b_tl = QtWidgets.QPushButton("🎬  Render timelapse video"); self.b_tl.setObjectName("primary")
-        self.b_tl.clicked.connect(self.run_timelapse)
+        self.b_tl.clicked.connect(lambda: self.run_timelapse(False))
         g.addRow("Effect", self.effect); g.addRow("Comet length", slider_row(self.tl_comet)); g.addRow("", self.tl_gap)
         g.addRow("End hold", self.hold); g.addRow("Speed", self.fps); g.addRow("Size", self.res)
         g.addRow("", self.defl); g.addRow("Deflicker strength", self.defl_w)
+        g.addRow("", self.hot_cb2); g.addRow("Noise reduction", self.nr_cb2)
         g.addRow("Save as", self.tl_fmt); g.addRow(self.warn); g.addRow(self.b_tl)
-        tabs.addTab(tl, "🎞  Timelapse")
+        tabs.addTab(tl, "🎞 Timelapse")
         self.effect_changed()
+
+        # ---- meteors tab
+        mt = QtWidgets.QWidget(); mf = QtWidgets.QFormLayout(mt); mf.setVerticalSpacing(8)
+        mf.addRow(note("Finds shooting stars: short, bright streaks that show up in only one or two frames. "
+                       "First click Find meteors, then use the buttons below."))
+        self.m_sens = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.m_sens.setRange(1, 10); self.m_sens.setValue(5)
+        self.m_sens.setToolTip("Higher finds fainter meteors but may add false detections")
+        self.m_len = QtWidgets.QSpinBox(); self.m_len.setRange(10, 400); self.m_len.setValue(30); self.m_len.setSuffix(" px")
+        self.m_len.setToolTip("Shortest streak to count (measured at 1600 px image width)")
+        self.m_ignore = QtWidgets.QCheckBox("Ignore planes && satellites"); self.m_ignore.setChecked(True)
+        self.m_ignore.setToolTip("Streaks that continue over 3 or more frames are not meteors")
+        self.b_find = QtWidgets.QPushButton("☄  Find meteors"); self.b_find.setObjectName("primary")
+        self.b_find.clicked.connect(self.run_meteor_search)
+        self.m_summary = QtWidgets.QLabel("No search yet."); self.m_summary.setObjectName("muted"); self.m_summary.setWordWrap(True)
+        self.meteor_list = QtWidgets.QListWidget(); self.meteor_list.setMinimumHeight(90); self.meteor_list.setMaximumHeight(130)
+        self.meteor_list.currentItemChanged.connect(self.show_meteor)
+        self.b_m_tick = QtWidgets.QPushButton("Tick only meteor frames"); self.b_m_tick.clicked.connect(self.tick_meteor_frames)
+        self.b_m_export = QtWidgets.QPushButton("Export meteor photos…"); self.b_m_export.clicked.connect(self.export_meteors)
+        self.b_m_pic = QtWidgets.QPushButton("Save meteors-only picture…"); self.b_m_pic.clicked.connect(self.save_meteor_picture)
+        self.m_persist = QtWidgets.QDoubleSpinBox(); self.m_persist.setRange(0, 30); self.m_persist.setValue(2); self.m_persist.setSuffix(" s")
+        self.m_persist.setToolTip("How long each meteor keeps glowing in the video after it appears")
+        self.m_mark = QtWidgets.QCheckBox("Circle each meteor")
+        self.b_m_video = QtWidgets.QPushButton("🎬  Timelapse with meteors highlighted…")
+        self.b_m_video.clicked.connect(lambda: self.run_timelapse(True))
+        mf.addRow("Sensitivity", slider_row(self.m_sens, "{}")); mf.addRow("Min. streak", self.m_len)
+        mf.addRow("", self.m_ignore); mf.addRow(self.b_find); mf.addRow(self.m_summary); mf.addRow(self.meteor_list)
+        mf.addRow(self.b_m_tick); mf.addRow(self.b_m_export); mf.addRow(self.b_m_pic)
+        mf.addRow("Glow time", self.m_persist); mf.addRow("", self.m_mark); mf.addRow(self.b_m_video)
+        mf.addRow(note("The video uses the speed, size and format chosen in the Timelapse tab."))
+        tabs.addTab(mt, "☄ Meteors")
+        self.meteor_result = None
+        self.set_meteor_actions(False)
 
         create = QtWidgets.QGroupBox("2   Choose what to make")
         cv_ = QtWidgets.QVBoxLayout(create); cv_.addWidget(tabs)
@@ -659,11 +991,11 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addWidget(create, 1); rv.addWidget(self.status); rv.addWidget(self.progress)
         rr = QtWidgets.QHBoxLayout(); rr.addWidget(self.open_btn, 1); rr.addWidget(self.cancel_btn)
         rv.addLayout(rr)
-        right_w.setFixedWidth(380)
+        right_w.setFixedWidth(420)
 
         split = QtWidgets.QSplitter()
         split.addWidget(photos); split.addWidget(self.preview); split.addWidget(right_w)
-        split.setStretchFactor(1, 1); split.setSizes([290, 650, 380]); split.setChildrenCollapsible(False)
+        split.setStretchFactor(1, 1); split.setSizes([290, 610, 420]); split.setChildrenCollapsible(False)
 
         # ================= header & footer =================
         icon_lbl = QtWidgets.QLabel(); icon_lbl.setObjectName("header")
@@ -810,6 +1142,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cancel_btn.setEnabled(busy)
         self.b_trail.setEnabled(not busy)
         self.b_tl.setEnabled(not busy)
+        self.b_find.setEnabled(not busy)
+
+    def set_meteor_actions(self, on):
+        for b in (self.b_m_tick, self.b_m_export, self.b_m_pic, self.b_m_video):
+            b.setEnabled(on)
+
+    # ---- meteors
+    def run_meteor_search(self):
+        def done(res):
+            self.meteor_result = res
+            ev = res["events"]
+            self.meteor_list.clear()
+            for e in sorted(ev, key=lambda e: e["frame"]):
+                it = QtWidgets.QListWidgetItem(f"☄ Frame {e['frame'] + 1} · {os.path.basename(e['path'])} · {int(e['length'])} px")
+                it.setData(QtCore.Qt.UserRole, e)
+                self.meteor_list.addItem(it)
+            msg = f"Found {len(ev)} meteor(s)"
+            if res["rejected"]:
+                msg += f" · ignored {res['rejected']} plane/satellite streak(s)"
+            self.m_summary.setText(msg)
+            self.status.setText("☄ " + msg)
+            self.set_meteor_actions(len(ev) > 0)
+            if not ev:
+                QtWidgets.QMessageBox.information(self, "No meteors found",
+                    "Nothing found. Try raising Sensitivity or lowering Min. streak.")
+        self.start(detect_meteors, done, sensitivity=self.m_sens.value(), min_length=self.m_len.value(),
+                   ignore_satellites=self.m_ignore.isChecked())
+
+    def show_meteor(self, cur, _prev):
+        if cur is None or not self.meteor_result:
+            return
+        e = cur.data(QtCore.Qt.UserRole)
+        try:
+            img = load_preview(e["path"])
+            dw = self.meteor_result["det_size"][0]
+            sc = img.shape[1] / dw
+            x, y, w, h = e["bbox"]
+            cv2.rectangle(img, (int(x * sc) - 14, int(y * sc) - 14), (int((x + w) * sc) + 14, int((y + h) * sc) + 14),
+                          (65535, 54000, 15000), 2, cv2.LINE_AA)
+            self.show_image(img)
+        except Exception as ex:
+            self.status.setText(f"Cannot preview: {ex}")
+
+    def meteor_events(self):
+        return self.meteor_result["events"] if self.meteor_result else []
+
+    def tick_meteor_frames(self):
+        paths = {e["path"] for e in self.meteor_events()}
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            it.setCheckState(QtCore.Qt.Checked if it.data(QtCore.Qt.UserRole) in paths else QtCore.Qt.Unchecked)
+        self.update_count()
+
+    def export_meteors(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose folder for the meteor photos")
+        if d:
+            self.start(export_meteor_frames, self.mark_saved, self.meteor_events(), d)
+
+    def save_meteor_picture(self):
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save meteors-only picture", "meteors.png", "PNG (*.png)")
+        if not out:
+            return
+        out = self.with_ext(out, ".png")
+
+        def done(img):
+            save_uncompressed(out, img, 16)
+            self.show_image(img)
+            self.mark_saved(out)
+        self.start(make_meteor_composite, done, self.meteor_events(), self.meteor_result["det_size"])
 
     def start(self, fn, on_done, *args, **kw):
         if self.worker is not None and self.worker.isRunning():
@@ -871,9 +1272,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_image(img)
             self.mark_saved(out)
         self.start(stack_star_trails, done, mode=mode, comet_length=self.comet.value() / 100,
-                   gap_fill=self.gap.isChecked())
+                   gap_fill=self.gap.isChecked(), hot_pixels=self.hot_cb.isChecked(),
+                   denoise=self.nr_cb.currentIndex())
 
-    def run_timelapse(self):
+    def run_timelapse(self, with_meteors=False):
+        if with_meteors and not self.meteor_events():
+            QtWidgets.QMessageBox.information(self, "No meteors", "Click 'Find meteors' first.")
+            return
         fmt = TL_FMT_KEYS[self.tl_fmt.currentIndex()]
         if fmt == "tiff_seq":
             out = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose output folder for TIFF frames")
@@ -886,12 +1291,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not out:
             return
         size = [None, (3840, 2160), (1920, 1080), (1280, 720)][self.res.currentIndex()]
+        extra = {}
+        if with_meteors:
+            extra = dict(meteors={"by_path": _group_by_path(self.meteor_events()),
+                                  "det_size": self.meteor_result["det_size"]},
+                         meteor_persist=self.m_persist.value(), meteor_mark=self.m_mark.isChecked())
         self.start(render_timelapse, self.mark_saved, out,
                    fps=self.fps.value(), size=size, deflicker=self.defl.isChecked(),
                    deflicker_window=self.defl_w.value(), fmt=fmt,
                    trail_mode=TL_EFFECT_KEYS[self.effect.currentIndex()],
                    comet_length=self.tl_comet.value() / 100, gap_fill=self.tl_gap.isChecked(),
-                   hold_seconds=self.hold.value())
+                   hold_seconds=self.hold.value(), hot_pixels=self.hot_cb2.isChecked(),
+                   denoise=self.nr_cb2.currentIndex(), **extra)
 
 
 def main():
