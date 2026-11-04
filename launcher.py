@@ -772,6 +772,290 @@ def export_meteor_frames(files, events, folder, progress=_noop, cancel=_never):
     return folder
 
 
+# ===== sequator-style sky stacking (align the stars, average, keep the ground sharp) =====
+def _sky_gray(img16, max_w=1600):
+    g = img16.astype(np.float32).mean(axis=2) / 65535.0
+    sc = min(1.0, max_w / g.shape[1])
+    if sc < 1:
+        g = cv2.resize(g, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    return g, sc
+
+
+def detect_stars(img16, y_limit=1.0, max_stars=180):
+    """Star centres (x, y, flux) in full-resolution pixel coordinates, brightest first."""
+    g, sc = _sky_gray(img16)
+    h, w = g.shape
+    hp = cv2.GaussianBlur(g, (0, 0), 1.0) - cv2.GaussianBlur(g, (0, 0), 18)
+    ylim = max(8, int(h * y_limit))
+    sample = hp[:ylim:2, ::2]
+    med = float(np.median(sample))
+    mad = float(np.median(np.abs(sample - med))) * 1.4826 + 1e-6
+    mask = hp > med + 5.0 * mad
+    mask[ylim:] = False
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return np.zeros((0, 3), np.float32)
+    area = stats[:, cv2.CC_STAT_AREA]
+    ok = (area >= 2) & (area <= 120)
+    ok[0] = False
+    lab = labels.ravel()
+    wgt = np.maximum(hp.ravel(), 0).astype(np.float64)
+    flux = np.bincount(lab, weights=wgt, minlength=n)
+    ys, xs = np.divmod(np.arange(lab.size), w)
+    cx = np.bincount(lab, weights=wgt * xs, minlength=n) / np.maximum(flux, 1e-12)
+    cy = np.bincount(lab, weights=wgt * ys, minlength=n) / np.maximum(flux, 1e-12)
+    idx = np.nonzero(ok)[0]
+    order = idx[np.argsort(-flux[idx])][:max_stars]
+    out = np.stack([(cx[order] + 0.5) / sc - 0.5, (cy[order] + 0.5) / sc - 0.5, flux[order]], axis=1)
+    return out.astype(np.float32)
+
+
+def _to3(A):
+    M = np.eye(3)
+    M[:2] = A
+    return M
+
+
+def _apply_m(M, pts):
+    return pts @ M[:2, :2].T + M[:2, 2]
+
+
+def _match_pts(src, dst, radius):
+    if len(src) < 3 or len(dst) < 3:
+        return np.zeros(0, int), np.zeros(0, int)
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    ms = [m for m in bf.match(src.astype(np.float32), dst.astype(np.float32)) if m.distance <= radius]
+    return np.array([m.queryIdx for m in ms], int), np.array([m.trainIdx for m in ms], int)
+
+
+def _icp_similarity(cur_xy, ref_xy, M0, radii=(40, 20, 10, 5)):
+    """Refine a similarity transform (current frame -> reference frame) by matching stars at shrinking radii."""
+    M = M0.copy()
+    for r in radii:
+        q, t = _match_pts(_apply_m(M, cur_xy), ref_xy, r)
+        if len(q) < 6:
+            return None
+        A, _ = cv2.estimateAffinePartial2D(cur_xy[q], ref_xy[t], method=cv2.RANSAC,
+                                           ransacReprojThreshold=max(1.5, r / 5.0), maxIters=2000, confidence=0.995)
+        if A is None:
+            return None
+        M = _to3(A)
+    q, _t = _match_pts(_apply_m(M, cur_xy), ref_xy, 3.0)
+    return M, len(q)
+
+
+def _vote_translation(cur_xy, ref_xy, cell=3.0, span=250):
+    a, b = cur_xy[:80], ref_xy[:80]
+    d = (b[None, :, :] - a[:, None, :]).reshape(-1, 2)
+    d = d[(np.abs(d[:, 0]) < span) & (np.abs(d[:, 1]) < span)]
+    if len(d) == 0:
+        return None
+    bins = int(2 * span / cell)
+    H, xe, ye = np.histogram2d(d[:, 0], d[:, 1], bins=bins, range=[[-span, span], [-span, span]])
+    i, j = np.unravel_index(np.argmax(H), H.shape)
+    return np.array([[1, 0, (xe[i] + xe[i + 1]) / 2], [0, 1, (ye[j] + ye[j + 1]) / 2], [0, 0, 1.0]])
+
+
+def align_frames(stars_list, ref_idx, progress=_noop, cancel=_never):
+    """Transform (3x3, current -> reference) for every frame, or None where the stars could not be matched."""
+    n = len(stars_list)
+    Ms = [None] * n
+    Ms[ref_idx] = np.eye(3)
+    ref_xy = stars_list[ref_idx][:, :2]
+    for direction in (1, -1):
+        m1 = m2 = None
+        i = ref_idx + direction
+        while 0 <= i < n:
+            if cancel():
+                raise InterruptedError("Cancelled")
+            progress(abs(i - ref_idx), n, f"Aligning stars {abs(i - ref_idx)}/{n - 1}")
+            cur_xy = stars_list[i][:, :2]
+            result = None
+            if len(cur_xy) >= 6 and len(ref_xy) >= 6:
+                if m1 is None:
+                    pred = np.eye(3)
+                elif m2 is None:
+                    pred = m1
+                else:
+                    pred = (m1 @ np.linalg.inv(m2)) @ m1          # keep turning at the same rate
+                need = max(8, int(0.25 * min(len(cur_xy), len(ref_xy))))
+                for init in (pred, _vote_translation(cur_xy, ref_xy)):
+                    if init is None:
+                        continue
+                    r = _icp_similarity(cur_xy, ref_xy, init)
+                    if r is not None and r[1] >= need:
+                        result = r[0]
+                        break
+            Ms[i] = result
+            if result is not None:
+                m2, m1 = m1, result
+            i += direction
+    return Ms
+
+
+def auto_horizon(files, fixer=None, samples=9):
+    """Guess where the ground starts (fraction of the height from the top), or None if the frame is all sky.
+    The median of several frames removes the drifting stars, so what stays textured is the ground."""
+    idx = np.unique(np.linspace(0, len(files) - 1, min(samples, len(files))).astype(int))
+    grays = []
+    for i in idx:
+        ext = os.path.splitext(files[i])[1].lower()
+        img = load_image(files[i], half_size=(ext in RAW_EXT))
+        if fixer is not None and fixer.shape == img.shape[:2]:
+            img = fixer.apply(img)
+        grays.append(_sky_gray(img, 800)[0])
+    shape = grays[0].shape
+    med = np.median(np.stack([g for g in grays if g.shape == shape]), axis=0)
+    med = cv2.GaussianBlur(med, (0, 0), 1.5)
+    mag = cv2.magnitude(cv2.Sobel(med, cv2.CV_32F, 1, 0), cv2.Sobel(med, cv2.CV_32F, 0, 1))
+    mag = np.minimum(mag, np.percentile(mag, 97))
+    h = mag.shape[0]
+    row = np.convolve(np.pad(mag.mean(axis=1), 6, mode="edge"), np.ones(13) / 13, mode="valid")
+    base = float(np.median(row[:max(4, h // 4)]))
+    peak = float(np.percentile(row[h // 2:], 90))
+    if peak < base * 2.5 + 1e-6:
+        return None
+    thr = base + 0.35 * (peak - base)
+    above = row > thr
+    tail = np.cumsum(above[::-1])[::-1] / np.arange(h, 0, -1)
+    for y in range(h):
+        if above[y] and tail[y] >= 0.85:
+            return max(0.0, y / h - 0.015)
+    return None
+
+
+def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, hot_pixels=True,
+              auto_levels=False, progress=_noop, cancel=_never):
+    """
+    Sequator-style stacking. Stars are aligned to the middle frame (cancelling Earth's rotation) and averaged,
+    which lowers noise by about sqrt(frames) while keeping the stars sharp. The ground is averaged WITHOUT
+    alignment so it stays sharp too, and the two are blended along the horizon.
+      ground: "auto" (find the horizon), None (all sky) or a fraction 0..0.8 of the height, from the bottom
+      reject: also throw away values that differ strongly between frames (satellites, planes, meteors)
+    Returns (image uint16, info dict).
+    """
+    n = len(files)
+    if n < 3:
+        raise ValueError("Sky stacking needs at least 3 photos")
+    fixer = build_hot_pixel_fixer(files, 5, progress=progress, cancel=cancel) if hot_pixels else None
+
+    def read(i):
+        img = load_image(files[i])
+        return fixer.apply(img) if fixer is not None else img
+
+    ref = n // 2
+    first = read(ref)
+    h, w = first.shape[:2]
+    if ground == "auto":
+        progress(0, n, "Finding the horizon…")
+        hz = auto_horizon(files, fixer)
+    elif ground is None:
+        hz = None
+    else:
+        hz = None if ground <= 0 else 1.0 - float(ground)
+    margin = max(4, int(0.03 * h))
+    sky_rows = h if hz is None else min(h, int(hz * h) + margin)
+    g0 = None if hz is None else max(0, int(hz * h) - margin)
+
+    # ---- stars and alignment
+    Ms = [None] * n
+    stars_count = []
+    if align:
+        stars = []
+        for i in range(n):
+            if cancel():
+                raise InterruptedError("Cancelled")
+            progress(i, n, f"Finding stars {i + 1}/{n}")
+            img = first if i == ref else read(i)
+            if img.shape[:2] != (h, w):
+                stars.append(np.zeros((0, 3), np.float32))
+            else:
+                stars.append(detect_stars(img, y_limit=(1.0 if hz is None else max(0.1, hz - 0.02))))
+        stars_count = [len(s) for s in stars]
+        if len(stars[ref]) < 8:
+            raise RuntimeError("Not enough stars found in the middle photo to align the frames")
+        Ms = align_frames(stars, ref, progress, cancel)
+    else:
+        Ms = [np.eye(3) for _ in range(n)]
+    usable = [i for i in range(n) if Ms[i] is not None]
+    failed = [i for i in range(n) if Ms[i] is None]
+    if len(usable) < 3:
+        raise RuntimeError("Could not align enough frames (found %d). Try photos with more visible stars." % len(usable))
+
+    # ---- stacking passes
+    ones = np.ones((h, w), np.uint8)
+    sum_sky = np.zeros((sky_rows, w, 3), np.float32)
+    cnt = np.zeros((sky_rows, w), np.float32)
+    sumsq = np.zeros_like(sum_sky) if reject else None
+    sum_g = np.zeros((h - g0, w, 3), np.float32) if g0 is not None else None
+    n_g = 0
+
+    def warped(i, img):
+        x = img.astype(np.float32) / 65535.0
+        A = Ms[i][:2].astype(np.float64)
+        wx = cv2.warpAffine(x, A, (w, sky_rows), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        vm = cv2.warpAffine(ones, A, (w, sky_rows), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return wx, vm.astype(np.float32)
+
+    for k in range(n):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(k, n, f"Stacking {k + 1}/{n}")
+        img = first if k == ref else read(k)
+        if img.shape[:2] != (h, w):
+            continue
+        if sum_g is not None:
+            sum_g += img[g0:].astype(np.float32) / 65535.0
+            n_g += 1
+        if Ms[k] is not None:
+            wx, vm = warped(k, img)
+            sum_sky += wx * vm[..., None]
+            cnt += vm
+            if sumsq is not None:
+                sumsq += (wx * wx) * vm[..., None]
+    mean = sum_sky / np.maximum(cnt, 1.0)[..., None]
+    sky = mean
+    if reject:
+        var = np.maximum(sumsq / np.maximum(cnt, 1.0)[..., None] - mean * mean, 0)
+        sd = np.sqrt(var)
+        sum2 = np.zeros_like(sum_sky)
+        cnt2 = np.zeros_like(sum_sky)
+        for k in range(n):
+            if cancel():
+                raise InterruptedError("Cancelled")
+            if Ms[k] is None:
+                continue
+            progress(k, n, f"Rejecting satellites {k + 1}/{n}")
+            img = first if k == ref else read(k)
+            if img.shape[:2] != (h, w):
+                continue
+            wx, vm = warped(k, img)
+            keep = (np.abs(wx - mean) <= clip_sigma * sd + 0.004) & (vm[..., None] > 0)
+            sum2 += wx * keep
+            cnt2 += keep
+        sky = np.where(cnt2 > 0, sum2 / np.maximum(cnt2, 1.0), mean)
+    del sum_sky, sumsq
+
+    # ---- blend sky and ground along the horizon
+    if g0 is None:
+        result = sky
+    else:
+        ground_img = sum_g / max(n_g, 1)
+        result = np.zeros((h, w, 3), np.float32)
+        result[:g0] = sky[:g0]
+        result[sky_rows:] = ground_img[sky_rows - g0:]
+        band = np.linspace(1.0, 0.0, sky_rows - g0 + 2, dtype=np.float32)[1:-1][:, None, None]
+        result[g0:sky_rows] = sky[g0:sky_rows] * band + ground_img[:sky_rows - g0] * (1 - band)
+    if auto_levels:
+        lo = float(np.percentile(result[::4, ::4], 0.5))
+        hi = float(np.percentile(result[::4, ::4], 99.8))
+        result = np.clip((result - lo) / max(hi - lo, 1e-6), 0, 1)
+    out = np.clip(result * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
+    progress(n, n, "Done")
+    return out, {"frames": n, "aligned": len(usable), "failed": failed, "horizon": hz,
+                 "stars": int(np.median(stars_count)) if stars_count else 0}
+
+
 # ===== starry sky art (generated in code, no image files needed) =====
 def make_starry_sky(w, h, seed=7):
     """Night sky with a milky-way glow, star-trail arcs and stars. Returns RGB uint8."""
@@ -901,7 +1185,7 @@ QComboBox, QDoubleSpinBox, QSpinBox { background:#111a40; border:1px solid #2f3f
                                       padding:5px 8px; min-height:18px; }
 QComboBox QAbstractItemView { background:#111a40; selection-background-color:#24357a; border:1px solid #2f3f85; }
 QTabWidget::pane { border:1px solid #243060; border-radius:10px; top:-1px; }
-QTabBar::tab { background:#111a40; padding:9px 12px; border-top-left-radius:8px; border-top-right-radius:8px;
+QTabBar::tab { background:#111a40; padding:9px 9px; border-top-left-radius:8px; border-top-right-radius:8px;
                margin-right:3px; color:#9aa6d6; }
 QTabBar::tab:selected { background:#1f2d6b; color:#ffd88a; font-weight:bold; }
 QProgressBar { border:1px solid #2f3f85; border-radius:8px; text-align:center; background:#0d1431;
@@ -1157,6 +1441,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.meteor_result = None
         self.set_meteor_actions(False)
 
+        # ---- sky stack tab (Sequator-style)
+        sk = QtWidgets.QWidget(); kf = QtWidgets.QFormLayout(sk); kf.setVerticalSpacing(10)
+        kf.addRow(note("Sequator-style stacking: the stars are aligned so Earth's rotation cancels out, then the frames "
+                       "are averaged. Much less noise, sharp stars, and the ground stays sharp too. "
+                       "Best with 10 or more tripod photos."))
+        self.sk_align = QtWidgets.QCheckBox("Align stars (cancel Earth's rotation)"); self.sk_align.setChecked(True)
+        self.sk_align.setToolTip("Turn off for a plain average of fixed-camera frames (stars will blur).")
+        self.sk_method = QtWidgets.QComboBox()
+        self.sk_method.addItems(["Average (smoothest)", "Average + reject satellites & planes (slower)"])
+        self.sk_method.setToolTip("The second option throws away anything that appears in only a few frames:\n"
+                                  "satellites, planes and meteors. It reads every photo twice.")
+        self.sk_ground = QtWidgets.QComboBox()
+        self.sk_ground.addItems(["Auto-detect horizon", "No ground (all sky)", "Ground: bottom 20 %",
+                                 "Ground: bottom 30 %", "Ground: bottom 40 %", "Ground: bottom 50 %"])
+        self.sk_ground.setToolTip("The ground does not rotate with the stars, so it is stacked WITHOUT alignment "
+                                  "and blended with the sky along the horizon.")
+        self.sk_hot = QtWidgets.QCheckBox("Remove hot pixels (recommended)"); self.sk_hot.setChecked(True)
+        self.sk_levels = QtWidgets.QCheckBox("Auto-brighten the result")
+        self.sk_levels.setToolTip("Stretches the levels so the stacked sky is easy to see.\nLeave off to keep the data untouched for editing.")
+        self.sk_fmt = QtWidgets.QComboBox(); self.sk_fmt.addItems([o[0] for o in TRAIL_OUTPUTS])
+        self.b_sky = QtWidgets.QPushButton("🌌  Stack the sky"); self.b_sky.setObjectName("primary")
+        self.b_sky.clicked.connect(self.run_sky_stack)
+        kf.addRow("", self.sk_align); kf.addRow("Method", self.sk_method); kf.addRow("Ground", self.sk_ground)
+        kf.addRow("", self.sk_hot); kf.addRow("", self.sk_levels); kf.addRow("Save as", self.sk_fmt); kf.addRow(self.b_sky)
+        kf.addRow(note("Needs enough stars to match between photos. Uses more memory than trails (about 3 bytes of "
+                       "working memory per pixel per colour)."))
+        tabs.addTab(scroll(sk), "🌌 Sky stack")
+
         create = QtWidgets.QGroupBox("2   Choose what to make")
         cv_ = QtWidgets.QVBoxLayout(create); cv_.addWidget(tabs)
 
@@ -1323,6 +1635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_trail.setEnabled(not busy)
         self.b_tl.setEnabled(not busy)
         self.b_find.setEnabled(not busy)
+        self.b_sky.setEnabled(not busy)
 
     def set_meteor_actions(self, on):
         for b in (self.b_m_tick, self.b_m_export, self.b_m_pic, self.b_m_video):
@@ -1455,6 +1768,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start(stack_star_trails, done, mode=mode, comet_length=self.comet.value() / 100,
                    gap_fill=self.gap.isChecked(), hot_pixels=self.hot_cb.isChecked(),
                    denoise=self.nr_cb.currentIndex())
+
+    def run_sky_stack(self):
+        _, ext, bits, flt = TRAIL_OUTPUTS[self.sk_fmt.currentIndex()]
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save stacked sky", "sky_stack" + ext, flt)
+        if not out:
+            return
+        out = self.with_ext(out, ext)
+        ground = ["auto", None, 0.2, 0.3, 0.4, 0.5][self.sk_ground.currentIndex()]
+
+        def done(res):
+            img, info = res
+            save_uncompressed(out, img, bits)
+            self.show_image(img)
+            self.mark_saved(out)
+            msg = f"✔ Saved: {out} · aligned {info['aligned']}/{info['frames']} frames"
+            if info["failed"]:
+                msg += f" ({len(info['failed'])} skipped: too few stars)"
+            if info["horizon"] is not None:
+                msg += f" · horizon at {int(info['horizon'] * 100)}% from the top"
+            self.status.setText(msg)
+        self.start(stack_sky, done, align=self.sk_align.isChecked(), reject=self.sk_method.currentIndex() == 1,
+                   ground=ground, hot_pixels=self.sk_hot.isChecked(), auto_levels=self.sk_levels.isChecked())
 
     def run_timelapse(self, with_meteors=False):
         if with_meteors and not self.meteor_events():
