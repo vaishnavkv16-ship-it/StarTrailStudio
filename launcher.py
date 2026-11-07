@@ -784,18 +784,23 @@ def _sky_gray(img16, max_w=1600):
     return g, sc
 
 
-def detect_stars(img16, y_limit=1.0, max_stars=180, gray_sc=None):
+def detect_stars(img16, y_limit=1.0, max_stars=180, gray_sc=None, sky=None):
     """Star centres (x, y, flux) in full-resolution pixel coordinates, brightest first.
     gray_sc = (grey image, scale) may be given instead of img16."""
     g, sc = gray_sc if gray_sc is not None else _sky_gray(img16)
     h, w = g.shape
     hp = cv2.GaussianBlur(g, (0, 0), 1.0) - cv2.GaussianBlur(g, (0, 0), 18)
     ylim = max(8, int(h * y_limit))
-    sample = hp[:ylim:2, ::2]
+    if sky is not None and (sky > 0.9).sum() > 200:
+        sample = hp[sky > 0.9][::3]
+    else:
+        sample = hp[:ylim:2, ::2].ravel()
     med = float(np.median(sample))
     mad = float(np.median(np.abs(sample - med))) * 1.4826 + 1e-6
     mask = hp > med + 5.0 * mad
     mask[ylim:] = False
+    if sky is not None:
+        mask &= sky > 0.9
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
     if n <= 1:
         return np.zeros((0, 3), np.float32)
@@ -895,6 +900,131 @@ def align_frames(stars_list, ref_idx, progress=_noop, cancel=_never):
                 m2, m1 = m1, result
             i += direction
     return Ms
+
+
+# ----- lens-distortion-aware registration (stars stay points in the corners)
+def _poly_cols(u, v, order):
+    cols, idx = [], []
+    for j in range(order + 1):
+        for i in range(order + 1 - j):
+            cols.append((u ** i) * (v ** j))
+            idx.append((j, i))
+    return np.stack(cols, axis=1), idx
+
+
+def _poly_eval(uv, Cx, Cy):
+    order = Cx.shape[0] - 1
+    A, idx = _poly_cols(uv[:, 0], uv[:, 1], order)
+    cx = np.array([Cx[j, i] for j, i in idx])
+    cy = np.array([Cy[j, i] for j, i in idx])
+    return np.stack([A @ cx, A @ cy], axis=1)
+
+
+def _fit_residual_poly(uv, d, order, lam=0.02):
+    """Robust ridge fit of the small displacement d(u, v) left over after the shift+rotation."""
+    keep = np.ones(len(uv), bool)
+    for _ in range(4):
+        A, idx = _poly_cols(uv[keep, 0], uv[keep, 1], order)
+        t = A.shape[1]
+        Aa = np.vstack([A, np.sqrt(lam) * np.eye(t)])
+        coefs = [np.linalg.lstsq(Aa, np.concatenate([d[keep, k], np.zeros(t)]), rcond=None)[0] for k in range(2)]
+        Cx = np.zeros((order + 1, order + 1))
+        Cy = np.zeros((order + 1, order + 1))
+        for (j, i), a, b in zip(idx, coefs[0], coefs[1]):
+            Cx[j, i], Cy[j, i] = a, b
+        res = np.linalg.norm(d - _poly_eval(uv, Cx, Cy), axis=1)
+        sd = 1.4826 * np.median(res[keep]) + 1e-3
+        new = res < max(0.4, 2.5 * sd)
+        if new.sum() < max(12, 2 * t) or (new == keep).all():
+            break
+        keep = new
+    return Cx, Cy
+
+
+class FrameXform:
+    """Maps reference pixels -> this frame's pixels: shift + rotation plus a small polynomial correction."""
+
+    def __init__(self, Minv, Cx, Cy, w, h):
+        self.Minv, self.Cx, self.Cy = Minv, Cx, Cy
+        self.cx, self.cy, self.s = w / 2.0, h / 2.0, max(w, h) / 2.0
+        self.order = 0 if Cx is None else Cx.shape[0] - 1
+
+    def maps(self, rows, w):
+        xs = np.arange(w, dtype=np.float32)
+        ys = np.arange(rows, dtype=np.float32)
+        M = self.Minv
+        mx = M[0, 0] * xs[None, :] + M[0, 1] * ys[:, None] + M[0, 2]
+        my = M[1, 0] * xs[None, :] + M[1, 1] * ys[:, None] + M[1, 2]
+        if self.Cx is not None:
+            u = (xs - self.cx) / self.s
+            v = (ys - self.cy) / self.s
+            Xp = np.stack([u ** i for i in range(self.order + 1)]).astype(np.float32)
+            Yp = np.stack([v ** j for j in range(self.order + 1)]).astype(np.float32)
+            mx += Yp.T @ (self.Cx.astype(np.float32) @ Xp)
+            my += Yp.T @ (self.Cy.astype(np.float32) @ Xp)
+        return mx.astype(np.float32), my.astype(np.float32)
+
+    def warp(self, x, rows):
+        """Resample frame x into reference geometry for the first `rows` rows; also returns a validity mask."""
+        h, w = x.shape[:2]
+        mx, my = self.maps(rows, w)
+        out = cv2.remap(x, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        valid = ((mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)).astype(np.float32)
+        return out, valid
+
+
+def refine_alignment(stars_list, Ms, ref_idx, w, h, distortion="auto"):
+    """Turn the shift+rotation transforms into FrameXform objects with a lens-distortion correction.
+    Returns (xforms, report); frames with poor star agreement are dropped (None)."""
+    n = len(stars_list)
+    ref_xy = stars_list[ref_idx][:, :2]
+    cx, cy, sc = w / 2.0, h / 2.0, max(w, h) / 2.0
+    norm = lambda p: np.stack([(p[:, 0] - cx) / sc, (p[:, 1] - cy) / sc], axis=1)
+    gu, gv = np.meshgrid(np.linspace(-w / 2, w / 2, 7) / sc, np.linspace(-h / 2, h / 2, 7) / sc)
+    grid = np.stack([gu.ravel(), gv.ravel()], axis=1)
+    xforms, rms, counts, orders = [None] * n, [np.nan] * n, [0] * n, [0] * n
+    for i in range(n):
+        M = Ms[i]
+        if M is None:
+            continue
+        cur = stars_list[i][:, :2]
+        Minv = np.linalg.inv(M)[:2]
+        pred = ref_xy @ Minv[:, :2].T + Minv[:, 2]
+        q, t = _match_pts(pred, cur, 4.0)
+        Cx = Cy = None
+        if distortion != "off" and len(q) >= 45:
+            for ord_ in ([3, 2, 1] if len(q) >= 110 else [2, 1]):
+                Cx_, Cy_ = _fit_residual_poly(norm(ref_xy[q]), cur[t] - pred[q], ord_)
+                if np.abs(_poly_eval(grid, Cx_, Cy_)).max() > 10:      # wild extrapolation: use a simpler model
+                    continue
+                pred2 = pred + _poly_eval(norm(ref_xy), Cx_, Cy_)
+                q2, t2 = _match_pts(pred2, cur, 2.5)                     # re-match with the corrected prediction
+                if len(q2) >= max(30, int(0.7 * len(q))):
+                    Cx_, Cy_ = _fit_residual_poly(norm(ref_xy[q2]), cur[t2] - pred[q2], ord_)
+                    Cx, Cy, orders[i] = Cx_, Cy_, ord_
+                    break
+        if Cx is not None:
+            pf = pred + _poly_eval(norm(ref_xy), Cx, Cy)
+            q3, t3 = _match_pts(pf, cur, 2.0)
+            res = np.linalg.norm(cur[t3] - pf[q3], axis=1) if len(q3) else np.array([9.0])
+        else:
+            q3, t3 = _match_pts(pred, cur, 2.0)
+            res = np.linalg.norm(cur[t3] - pred[q3], axis=1) if len(q3) else np.array([9.0])
+        counts[i], rms[i] = len(q3), float(np.sqrt(np.mean(res ** 2)))
+        xforms[i] = FrameXform(Minv, Cx, Cy, w, h)
+    ok = [i for i in range(n) if xforms[i] is not None]
+    if ok:
+        med_n = float(np.median([counts[i] for i in ok]))
+        med_r = float(np.median([rms[i] for i in ok]))
+        for i in ok:
+            if counts[i] < 0.4 * med_n or rms[i] > max(1.2, 3.0 * med_r):    # clouds, shaken frames
+                xforms[i] = None
+    good = [i for i in range(n) if xforms[i] is not None]
+    report = {"rms_median": float(np.median([rms[i] for i in good])) if good else float("nan"),
+              "rms_worst": float(max([rms[i] for i in good])) if good else float("nan"),
+              "order": int(max(orders)) if orders else 0,
+              "dropped_quality": [i for i in ok if xforms[i] is None]}
+    return xforms, report
 
 
 def auto_horizon(files, fixer=None, samples=9):
@@ -1028,15 +1158,153 @@ def build_calibration(darks, flats, biases, progress=_noop, cancel=_never):
     return Calibration(dark, flat, bias)
 
 
-def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, hot_pixels=True,
-              auto_levels=False, darks=None, flats=None, biases=None, progress=_noop, cancel=_never):
+# ----- sky / ground separation (Sequator's "sky region")
+def auto_sky_mask(files, fixer=None, progress=_noop, cancel=_never, samples=8, work_w=800, grow=0.008):
     """
-    Sequator-style stacking. Light frames are calibrated (dark / flat / bias, if given), then the stars are
-    aligned to the middle frame (cancelling Earth's rotation) and averaged in linear light. That lowers noise by
-    about sqrt(frames) and keeps the stars sharp. The ground is averaged WITHOUT alignment so it stays sharp too,
-    and the two are blended along the horizon.
-      ground: "auto" (find the horizon), None (all sky) or a fraction 0..0.8 of the height, from the bottom
-      reject: also throw away values that differ strongly between frames (satellites, planes, meteors)
+    Finds the sky automatically, including irregular horizons (ridges, trees).
+    Idea: align a few frames on the stars. Stacking aligned makes the sky sharp and the ground blurry;
+    stacking unaligned does the opposite. Wherever the unaligned stack has more fine detail it is ground.
+    Returns a float mask (1 = sky, 0 = ground) at working resolution, or None if no ground was found.
+    """
+    n = len(files)
+    idx = np.unique(np.linspace(0, n - 1, min(samples, n)).astype(int))
+    G = []
+    for k, i in enumerate(idx):
+        if cancel():
+            raise InterruptedError("Cancelled")
+        progress(k, len(idx), f"Finding the sky and ground {k + 1}/{len(idx)}")
+        ext = os.path.splitext(files[i])[1].lower()
+        lin = load_linear(files[i], half_size=(ext in RAW_EXT))
+        g = lin.mean(axis=2).astype(np.float32)
+        sc = min(1.0, work_w / g.shape[1])
+        G.append(cv2.resize(g, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1 else g)
+    shape = G[0].shape
+    G = [g for g in G if g.shape == shape]
+    if len(G) < 4:
+        return None
+    S = [detect_stars(None, 1.0, 150, gray_sc=(g, 1.0))[:, :2] for g in G]
+    # stars that never move (street lights, hot pixels) are not sky
+    moving = []
+    for a, pts in enumerate(S):
+        hits = np.zeros(len(pts), int)
+        for b, other in enumerate(S):
+            if a != b and len(pts) and len(other):
+                q, _t = _match_pts(pts, other, 1.5)
+                hits[q] += 1
+        moving.append(pts[hits < 0.5 * (len(S) - 1)])
+    mid = len(G) // 2
+    if len(moving[mid]) < 8:
+        return None
+    Ms = align_frames([np.hstack([p, np.ones((len(p), 1), np.float32)]) for p in moving], mid)
+    h0, w0 = shape
+    acc = np.zeros(shape, np.float32)
+    cnt = np.zeros(shape, np.float32)
+    ones = np.ones(shape, np.uint8)
+    for g, M in zip(G, Ms):
+        if M is None:
+            continue
+        A = M[:2].astype(np.float64)
+        acc += cv2.warpAffine(g, A, (w0, h0), flags=cv2.INTER_LINEAR)
+        cnt += cv2.warpAffine(ones, A, (w0, h0), flags=cv2.INTER_NEAREST).astype(np.float32)
+    if cnt.max() < 3:
+        return None
+    aligned = acc / np.maximum(cnt, 1)
+    static = np.mean(np.stack(G), axis=0)
+
+    def detail(x):
+        hp = cv2.GaussianBlur(x, (0, 0), 1.2) - cv2.GaussianBlur(x, (0, 0), 6)
+        return cv2.GaussianBlur(hp * hp, (0, 0), 10)
+    EA, EU = detail(aligned), detail(static)
+    noise_a = float(np.percentile(EA, 10)) + 1e-12            # each stack is compared with ITS OWN noise floor
+    noise_u = float(np.percentile(EU, 10)) + 1e-12
+    markers = np.zeros(shape, np.uint8)
+    markers[(EA > 6 * noise_a) & (EA > 1.3 * EU)] = 1         # sharp only when aligned on the stars -> sky
+    markers[(EU > 6 * noise_u) & (EU > 1.3 * EA)] = 2         # sharp only when NOT aligned -> ground
+    if (markers == 2).mean() < 0.004:
+        return None                                              # no ground in this picture
+    if (markers == 1).mean() < 0.004:
+        return np.zeros(shape, np.float32)
+    _d, labels = cv2.distanceTransformWithLabels((markers == 0).astype(np.uint8), cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    lut = np.zeros(int(labels.max()) + 1, np.uint8)
+    lut[labels[markers > 0]] = markers[markers > 0]
+    filled = lut[labels]                                         # every pixel takes its nearest sky/ground label
+    sky = (filled == 1).astype(np.uint8)
+    k = max(3, int(0.02 * w0) | 1)
+    sky = cv2.medianBlur(sky * 255, k) // 255
+    if grow > 0:                                                 # let the sky edge creep towards the ground a little
+        r = max(1, int(grow * w0))
+        sky = cv2.dilate(sky, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    for cls in (1, 0):                                           # remove tiny islands
+        nlab, lab, stats, _ = cv2.connectedComponentsWithStats((sky == cls).astype(np.uint8), connectivity=8)
+        small = np.nonzero(stats[1:, cv2.CC_STAT_AREA] < 0.004 * h0 * w0)[0] + 1
+        for sidx in small:
+            sky[lab == sidx] = 1 - cls
+    return sky.astype(np.float32)
+
+
+def _reduce_light_pollution(lin, mask, order=3, apply_mask=None):
+    """Fit a smooth surface to the sky background (stars rejected) and subtract it - removes gradients."""
+    h, w = lin.shape[:2]
+    step = max(1, max(h, w) // 320)
+    small = lin[::step, ::step]
+    mk = mask[::step, ::step] > 0.95
+    if mk.sum() < 500:
+        return lin
+    U, V = np.meshgrid(np.linspace(-1, 1, small.shape[1]), np.linspace(-1, 1, small.shape[0]))
+    A, idx = _poly_cols(U[mk], V[mk], order)
+    uf = np.linspace(-1, 1, w, dtype=np.float32)
+    vf = np.linspace(-1, 1, h, dtype=np.float32)
+    out = lin.copy()
+    for c in range(3):
+        vals = small[..., c][mk]
+        keep = np.ones(len(vals), bool)
+        coef = np.zeros(A.shape[1])
+        for _ in range(6):
+            coef = np.linalg.lstsq(A[keep], vals[keep], rcond=None)[0]
+            res = vals - A @ coef
+            sd = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep]))) + 1e-9
+            keep = (res < 1.5 * sd) & (res > -4 * sd)
+            if keep.sum() < A.shape[1] * 4:
+                break
+        surf = np.zeros((h, w), np.float32)
+        for (j, i), cv_ in zip(idx, coef):
+            surf += np.float32(cv_) * (vf[:, None] ** j) * (uf[None, :] ** i)
+        ped = float(np.percentile(surf[mask > 0.95][::97], 1))
+        if apply_mask is None:
+            wgt = mask
+        else:                                                    # beyond the core sky, only touch pixels that look like sky
+            tau = max(0.008, 5.0 * sd)
+            sl = np.exp(-(((lin[..., c] - surf) / tau) ** 2))
+            wgt = np.maximum(mask, np.clip(apply_mask - mask, 0, 1) * sl)
+        out[..., c] -= (surf - ped) * wgt
+    return np.maximum(out, 0)
+
+
+def _enhance_stars(lin, mask, k):
+    """Boost the light of stars (Sequator's 'Enhance star light'); noise is left alone."""
+    hp = lin - cv2.GaussianBlur(lin, (0, 0), 3)
+    sel = hp[::4, ::4][mask[::4, ::4] > 0.9]
+    noise = 1.4826 * float(np.median(np.abs(sel - np.median(sel)))) if sel.size else 0.0
+    return lin + k * np.maximum(hp - 3.0 * noise, 0) * mask[..., None]
+
+
+def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, hot_pixels=True,
+              auto_levels=False, darks=None, flats=None, biases=None, distortion="auto",
+              sky_mask=None, feather=0.012, unify=False, reduce_lp=False, star_boost=0.0,
+              progress=_noop, cancel=_never):
+    """
+    Sequator-style stacking.
+      1. light frames are calibrated (dark / flat / bias, if given) and hot pixels repaired
+      2. stars are detected in the sky region and every frame is aligned to the middle frame, including a
+         lens-distortion correction, so stars stay points even in the corners
+      3. the aligned frames are averaged in linear light (optionally rejecting satellites, planes, meteors)
+      4. the ground ("freeze ground") is averaged WITHOUT alignment so it stays sharp
+      5. sky and ground are blended through a feathered sky mask
+      6. optional: light-pollution gradient removal and star-light enhancement
+    ground: "auto" (detect sky/ground, irregular horizons too), "mask" (use sky_mask, painted by the user),
+            None (all sky), or a fraction 0..0.8 of the height from the bottom (straight horizon)
+    unify:  match every frame's sky brightness to the middle frame first
     Returns (image uint16 sRGB, info dict).
     """
     n = len(files)
@@ -1045,32 +1313,62 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
     cal = build_calibration(darks, flats, biases, progress, cancel)
     fixer = build_hot_pixel_fixer(files, 5, progress=progress, cancel=cancel) if hot_pixels else None
 
-    def read(i):
+    def read(i, gain=1.0):
         lin = load_linear(files[i])
         if cal is not None:
             lin = cal.apply(lin)                            # calibrate BEFORE aligning: sensor defects must not rotate
         if fixer is not None and fixer.shape == lin.shape[:2]:
             lin = fixer.apply(lin)
-        return lin
+        return lin * np.float32(gain) if gain != 1.0 else lin
 
     ref = n // 2
     first = read(ref)
     h, w = first.shape[:2]
-    if ground == "auto":
-        progress(0, n, "Finding the horizon…")
-        hz = auto_horizon(files, fixer)
-    elif ground is None:
-        hz = None
-    else:
-        hz = None if ground <= 0 else 1.0 - float(ground)
-    margin = max(4, int(0.03 * h))
-    sky_rows = h if hz is None else min(h, int(hz * h) + margin)
-    g0 = None if hz is None else max(0, int(hz * h) - margin)
 
-    # ---- stars and alignment
-    stars_count = []
-    if align:
-        stars = []
+    # ---- sky region (1 = sky, 0 = ground)
+    bin_mask = None
+    mask_note = "all sky"
+    if ground == "mask":
+        if sky_mask is None:
+            raise ValueError("Paint a sky mask first (Edit sky mask…), or choose another Sky region option")
+        bin_mask = (cv2.resize(sky_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR) > 0.5).astype(np.float32)
+        mask_note = "painted mask"
+    elif ground == "auto":
+        auto = None
+        try:
+            auto = auto_sky_mask(files, fixer, progress, cancel)
+        except InterruptedError:
+            raise
+        except Exception:
+            auto = None
+        if auto is not None:
+            bin_mask = (cv2.resize(auto, (w, h), interpolation=cv2.INTER_LINEAR) > 0.5).astype(np.float32)
+            mask_note = "auto-detected"
+        else:
+            hz = auto_horizon(files, fixer)
+            if hz is not None:
+                bin_mask = np.ones((h, w), np.float32)
+                bin_mask[int(hz * h):] = 0
+                mask_note = "horizon line"
+    elif ground is not None and ground > 0:
+        bin_mask = np.ones((h, w), np.float32)
+        bin_mask[int((1.0 - float(ground)) * h):] = 0
+        mask_note = "horizon line"
+    if bin_mask is None:
+        mask = np.ones((h, w), np.float32)
+    else:
+        mask = np.clip(cv2.GaussianBlur(bin_mask, (0, 0), max(1.0, feather * h)), 0, 1)
+    rows_any = np.nonzero(mask.max(axis=1) > 0.002)[0]
+    if len(rows_any) == 0:
+        raise ValueError("The sky mask is empty - paint at least some sky")
+    sky_rows = int(rows_any[-1]) + 1
+    rows_gr = np.nonzero(mask.min(axis=1) < 0.998)[0]
+    g0 = int(rows_gr[0]) if len(rows_gr) else None
+
+    # ---- analysis pass: stars (sky only) and sky brightness
+    stars, stars_count = [], []
+    bgs = np.ones(n)
+    if align or unify:
         sc = min(1.0, 1600.0 / w)
         for i in range(n):
             if cancel():
@@ -1083,20 +1381,30 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
             g = lin.mean(axis=2).astype(np.float32)
             if sc < 1:
                 g = cv2.resize(g, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
-            stars.append(detect_stars(None, y_limit=(1.0 if hz is None else max(0.1, hz - 0.02)), gray_sc=(g, sc)))
+            mk = cv2.resize(mask, (g.shape[1], g.shape[0]), interpolation=cv2.INTER_AREA)
+            if unify:
+                sel = g[mk > 0.9]
+                bgs[i] = float(np.median(sel[::7])) if sel.size else 1.0
+            if align:
+                stars.append(detect_stars(None, 1.0, 180, gray_sc=(g, sc), sky=mk))
         stars_count = [len(x) for x in stars]
+    gains = np.clip(bgs[ref] / np.maximum(bgs, 1e-9), 0.5, 2.0) if unify else np.ones(n)
+    if align:
         if len(stars[ref]) < 8:
-            raise RuntimeError("Not enough stars found in the middle photo to align the frames")
+            raise RuntimeError("Not enough stars found in the sky of the middle photo to align the frames. "
+                               "Check the sky region (mask) or use photos with more visible stars.")
         Ms = align_frames(stars, ref, progress, cancel)
+        progress(0, n, "Correcting lens distortion…")
+        xf, align_report = refine_alignment(stars, Ms, ref, w, h, distortion)
     else:
-        Ms = [np.eye(3) for _ in range(n)]
-    usable = [i for i in range(n) if Ms[i] is not None]
-    failed = [i for i in range(n) if Ms[i] is None]
+        xf = [FrameXform(np.eye(3)[:2], None, None, w, h) for _ in range(n)]
+        align_report = {"rms_median": 0.0, "rms_worst": 0.0, "order": 0, "dropped_quality": []}
+    usable = [i for i in range(n) if xf[i] is not None]
+    failed = [i for i in range(n) if xf[i] is None]
     if len(usable) < 3:
         raise RuntimeError("Could not align enough frames (found %d). Try photos with more visible stars." % len(usable))
 
     # ---- stacking passes (linear light)
-    ones = np.ones((h, w), np.uint8)
     sum_sky = np.zeros((sky_rows, w, 3), np.float32)
     cnt = np.zeros((sky_rows, w), np.float32)
     sumsq = np.zeros_like(sum_sky) if reject else None
@@ -1104,22 +1412,19 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
     n_g = 0
 
     def warped(i, x):
-        A = Ms[i][:2].astype(np.float64)
-        wx = cv2.warpAffine(x, A, (w, sky_rows), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        vm = cv2.warpAffine(ones, A, (w, sky_rows), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        return wx, vm.astype(np.float32)
+        return xf[i].warp(x, sky_rows)
 
     for k in range(n):
         if cancel():
             raise InterruptedError("Cancelled")
         progress(k, n, f"Stacking {k + 1}/{n}")
-        x = first if k == ref else read(k)
+        x = first * np.float32(gains[k]) if k == ref and gains[k] != 1.0 else (first if k == ref else read(k, gains[k]))
         if x.shape[:2] != (h, w):
             continue
         if sum_g is not None:
             sum_g += x[g0:]
             n_g += 1
-        if Ms[k] is not None:
+        if xf[k] is not None:
             wx, vm = warped(k, x)
             sum_sky += wx * vm[..., None]
             cnt += vm
@@ -1127,6 +1432,7 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
                 sumsq += (wx * wx) * vm[..., None]
     mean = sum_sky / np.maximum(cnt, 1.0)[..., None]
     sky = mean
+    kept_fraction = 1.0
     if reject:
         var = np.maximum(sumsq / np.maximum(cnt, 1.0)[..., None] - mean * mean, 0)
         sd = np.sqrt(var)
@@ -1135,10 +1441,10 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
         for k in range(n):
             if cancel():
                 raise InterruptedError("Cancelled")
-            if Ms[k] is None:
+            if xf[k] is None:
                 continue
             progress(k, n, f"Rejecting satellites {k + 1}/{n}")
-            x = first if k == ref else read(k)
+            x = first if (k == ref and gains[k] == 1.0) else read(k, gains[k])
             if x.shape[:2] != (h, w):
                 continue
             wx, vm = warped(k, x)
@@ -1146,18 +1452,22 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
             sum2 += wx * keep
             cnt2 += keep
         sky = np.where(cnt2 > 0, sum2 / np.maximum(cnt2, 1.0), mean)
+        kept_fraction = float(cnt2.sum() / max(float((cnt[..., None] * 3).sum()), 1.0))
     del sum_sky, sumsq
 
-    # ---- blend sky and ground along the horizon
-    if g0 is None:
-        result = sky
-    else:
-        ground_img = sum_g / max(n_g, 1)
-        result = np.zeros((h, w, 3), np.float32)
-        result[:g0] = sky[:g0]
-        result[sky_rows:] = ground_img[sky_rows - g0:]
-        band = np.linspace(1.0, 0.0, sky_rows - g0 + 2, dtype=np.float32)[1:-1][:, None, None]
-        result[g0:sky_rows] = sky[g0:sky_rows] * band + ground_img[:sky_rows - g0] * (1 - band)
+    # ---- blend sky and ground through the mask
+    result = np.zeros((h, w, 3), np.float32)
+    result[:sky_rows] = sky * mask[:sky_rows, :, None]
+    if g0 is not None:
+        result[g0:] += (sum_g / max(n_g, 1)) * (1 - mask[g0:, :, None])
+    if reduce_lp:
+        progress(n, n, "Removing light-pollution gradient…")
+        r = max(1, int(0.06 * h))                            # the glow also lies over the cautious strip above the ridge
+        wide = cv2.dilate((mask > 0.5).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+        wide = np.clip(cv2.GaussianBlur(wide, (0, 0), max(1.0, 0.5 * feather * h)), 0, 1)
+        result = _reduce_light_pollution(result, mask, apply_mask=np.maximum(mask, wide))
+    if star_boost > 0:
+        result = _enhance_stars(result, mask, float(star_boost))
     out = linear_to_srgb16(result)
     if auto_levels:
         enc = out.astype(np.float32) / 65535.0
@@ -1165,8 +1475,10 @@ def stack_sky(files, align=True, reject=False, ground="auto", clip_sigma=2.5, ho
         hi = float(np.percentile(enc[::4, ::4], 99.8))
         out = (np.clip((enc - lo) / max(hi - lo, 1e-6), 0, 1) * 65535.0 + 0.5).astype(np.uint16)
     progress(n, n, "Done")
-    return out, {"frames": n, "aligned": len(usable), "failed": failed, "horizon": hz,
-                 "stars": int(np.median(stars_count)) if stars_count else 0,
+    return out, {"frames": n, "aligned": len(usable), "failed": failed, "mask": mask_note,
+                 "sky_fraction": float(mask.mean()),
+                 "stars": int(np.median(stars_count)) if stars_count else 0, "align": align_report,
+                 "gains": (float(gains.min()), float(gains.max())), "kept_fraction": kept_fraction,
                  "darks": len(darks or []), "flats": len(flats or []), "biases": len(biases or [])}
 
 
@@ -1380,6 +1692,145 @@ TL_EFFECT_KEYS = [None, "lighten", "comet"]
 DEFAULT_HINT = "Drop your night-sky photos here"
 
 
+def display_stretch(img16):
+    """Brighten a dark 16-bit picture for ON-SCREEN viewing only (the saved file is not changed)."""
+    f = img16.astype(np.float32) / 65535.0
+    lo = float(np.percentile(f[::4, ::4], 1))
+    hi = float(np.percentile(f[::4, ::4], 99.7))
+    f = np.clip((f - lo) / max(hi - lo, 1e-6), 0, 1) ** 0.6
+    return (f * 255).astype(np.uint8)
+
+
+class MaskCanvas(QtWidgets.QWidget):
+    """Picture with a green overlay for the sky; paint with the mouse like in Sequator."""
+
+    def __init__(self, base_rgb8, mask):
+        super().__init__()
+        self.h, self.w = base_rgb8.shape[:2]
+        self.base = rgb8_to_qimage(base_rgb8)
+        self.mask = (mask > 0).astype(np.uint8)
+        self.brush = max(8, self.w // 25)
+        self.paint_value = 1
+        self._last = None
+        self._value = 1
+        self._cursor = None
+        self._overlay = None
+        self.setMouseTracking(True)
+        self.setMinimumSize(640, 420)
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self._rebuild()
+
+    def _rebuild(self):
+        rgba = np.zeros((self.h, self.w, 4), np.uint8)
+        rgba[..., 1] = 255
+        rgba[..., 3] = self.mask * 95
+        self._rgba = np.ascontiguousarray(rgba)
+        self._overlay = QtGui.QImage(self._rgba.data, self.w, self.h, 4 * self.w, QtGui.QImage.Format_RGBA8888)
+        self.update()
+
+    def _geom(self):
+        sc = min(self.width() / self.w, self.height() / self.h)
+        return sc, (self.width() - self.w * sc) / 2, (self.height() - self.h * sc) / 2
+
+    def _to_img(self, pos):
+        sc, ox, oy = self._geom()
+        return int((pos.x() - ox) / sc), int((pos.y() - oy) / sc)
+
+    def _stamp(self, a, b, val):
+        cv2.line(self.mask, a, b, int(val), int(self.brush), cv2.LINE_8)
+        cv2.circle(self.mask, b, int(self.brush // 2), int(val), -1)
+        self._rebuild()
+
+    def mousePressEvent(self, e):
+        self._value = self.paint_value if e.button() == QtCore.Qt.LeftButton else 1 - self.paint_value
+        p = self._to_img(e.position())
+        self._last = p
+        self._stamp(p, p, self._value)
+
+    def mouseMoveEvent(self, e):
+        self._cursor = e.position()
+        if e.buttons() and self._last is not None:
+            p = self._to_img(e.position())
+            self._stamp(self._last, p, self._value)
+            self._last = p
+        else:
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        self._last = None
+
+    def wheelEvent(self, e):
+        self.brush = int(np.clip(self.brush * (1.15 if e.angleDelta().y() > 0 else 1 / 1.15), 4, self.w // 4))
+        self.update()
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor("#050816"))
+        sc, ox, oy = self._geom()
+        target = QtCore.QRectF(ox, oy, self.w * sc, self.h * sc)
+        p.drawImage(target, self.base)
+        p.drawImage(target, self._overlay)
+        if self._cursor is not None:
+            p.setPen(QtGui.QPen(QtGui.QColor("#ffd36b"), 1.5))
+            p.drawEllipse(self._cursor, self.brush * sc / 2, self.brush * sc / 2)
+
+
+class SkyMaskDialog(QtWidgets.QDialog):
+    def __init__(self, parent, base_rgb8, mask, auto_fn):
+        super().__init__(parent)
+        self.setWindowTitle("Sky mask - paint the sky")
+        self.resize(980, 700)
+        self.auto_fn = auto_fn
+        self.canvas = MaskCanvas(base_rgb8, mask)
+        info = QtWidgets.QLabel("Paint the SKY (green) with the left mouse button; the right button paints GROUND. "
+                                "Keep a small gap from the foreground. Mouse wheel changes the brush size.")
+        info.setWordWrap(True)
+        info.setObjectName("muted")
+        self.r_sky = QtWidgets.QRadioButton("Paint sky"); self.r_sky.setChecked(True)
+        self.r_gnd = QtWidgets.QRadioButton("Paint ground")
+        self.r_sky.toggled.connect(lambda on: setattr(self.canvas, "paint_value", 1 if on else 0))
+        size = QtWidgets.QSlider(QtCore.Qt.Horizontal); size.setRange(4, max(8, self.canvas.w // 4))
+        size.setValue(self.canvas.brush); size.setFixedWidth(150)
+        size.valueChanged.connect(lambda v: (setattr(self.canvas, "brush", v), self.canvas.update()))
+        b_auto = QtWidgets.QPushButton("✨ Auto-detect"); b_auto.clicked.connect(self.run_auto)
+        b_all = QtWidgets.QPushButton("All sky"); b_all.clicked.connect(lambda: self.fill(1))
+        b_none = QtWidgets.QPushButton("All ground"); b_none.clicked.connect(lambda: self.fill(0))
+        b_inv = QtWidgets.QPushButton("Invert"); b_inv.clicked.connect(self.invert)
+        ok = QtWidgets.QPushButton("Use this mask"); ok.setObjectName("primary"); ok.clicked.connect(self.accept)
+        cancel = QtWidgets.QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        row = QtWidgets.QHBoxLayout()
+        for wdg in (self.r_sky, self.r_gnd, QtWidgets.QLabel("Brush"), size, b_auto, b_all, b_none, b_inv):
+            row.addWidget(wdg)
+        row.addStretch()
+        row.addWidget(cancel); row.addWidget(ok)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(info); lay.addWidget(self.canvas, 1); lay.addLayout(row)
+
+    def fill(self, v):
+        self.canvas.mask[:] = v
+        self.canvas._rebuild()
+
+    def invert(self):
+        self.canvas.mask[:] = 1 - self.canvas.mask
+        self.canvas._rebuild()
+
+    def run_auto(self):
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            m = self.auto_fn()
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if m is None:
+            QtWidgets.QMessageBox.information(self, "Auto-detect", "No ground was found in these photos (or there were too few stars). "
+                                              "Paint the sky by hand, or leave it all sky.")
+            return
+        self.canvas.mask[:] = m
+        self.canvas._rebuild()
+
+    def result(self):
+        return self.canvas.mask.copy()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1556,27 +2007,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_meteor_actions(False)
 
         # ---- sky stack tab (Sequator-style)
-        sk = QtWidgets.QWidget(); kf = QtWidgets.QFormLayout(sk); kf.setVerticalSpacing(10)
-        kf.addRow(note("Sequator-style stacking: the stars are aligned so Earth's rotation cancels out, then the frames "
-                       "are averaged. Much less noise, sharp stars, and the ground stays sharp too. "
-                       "Best with 10 or more tripod photos."))
+        sk = QtWidgets.QWidget(); kf = QtWidgets.QFormLayout(sk); kf.setVerticalSpacing(8)
+        self.sky_mask = None
+
+        def section(text):
+            l = QtWidgets.QLabel(text); l.setStyleSheet("color:#ffd88a;font-weight:bold;padding-top:8px;"); return l
+        kf.addRow(note("Sequator-style stacking. Your LIGHT frames are the photos in the list on the left. "
+                       "Stars are aligned (lens distortion corrected), the sky is averaged, the ground stays frozen."))
+        kf.addRow(section("① Alignment"))
         self.sk_align = QtWidgets.QCheckBox("Align stars (cancel Earth's rotation)"); self.sk_align.setChecked(True)
-        self.sk_align.setToolTip("Turn off for a plain average of fixed-camera frames (stars will blur).")
+        self.sk_dist = QtWidgets.QComboBox(); self.sk_dist.addItems(["Auto (recommended)", "Off (shift + rotation only)"])
+        self.sk_dist.setToolTip("Wide-angle lenses bend the picture, so stars in the corners drift differently.\\n"
+                                "Auto fits a small correction for every frame so stars stay sharp points everywhere.")
+        kf.addRow("", self.sk_align); kf.addRow("Lens distortion", self.sk_dist)
+        kf.addRow(section("② Sky region"))
+        self.sk_region = QtWidgets.QComboBox()
+        self.sk_region.addItems(["Auto (detect sky & ground)", "Painted mask (Sequator style)", "Horizon line: bottom 20 %",
+                                 "Horizon line: bottom 30 %", "Horizon line: bottom 40 %", "Horizon line: bottom 50 %",
+                                 "No ground (all sky)"])
+        self.sk_region.setToolTip("The ground does not turn with the stars, so it is stacked WITHOUT alignment.\\n"
+                                  "Auto finds an irregular horizon (hills, trees). Painted mask = full control.")
+        self.sk_edit = QtWidgets.QPushButton("🖌  Edit sky mask…"); self.sk_edit.clicked.connect(self.edit_sky_mask)
+        self.sk_mask_lbl = QtWidgets.QLabel("no mask painted yet"); self.sk_mask_lbl.setObjectName("muted")
+        self.sk_blend = QtWidgets.QComboBox(); self.sk_blend.addItems(["Narrow", "Normal", "Wide"]); self.sk_blend.setCurrentIndex(1)
+        self.sk_blend.setToolTip("How softly the sky fades into the ground along the horizon.")
+        kf.addRow("Sky region", self.sk_region); kf.addRow("", self.sk_edit); kf.addRow("", self.sk_mask_lbl)
+        kf.addRow("Horizon blend", self.sk_blend)
+        kf.addRow(section("③ Stacking"))
         self.sk_method = QtWidgets.QComboBox()
         self.sk_method.addItems(["Average (smoothest)", "Average + reject satellites & planes (slower)"])
-        self.sk_method.setToolTip("The second option throws away anything that appears in only a few frames:\n"
+        self.sk_method.setToolTip("The second option throws away anything that appears in only a few frames:\\n"
                                   "satellites, planes and meteors. It reads every photo twice.")
-        self.sk_ground = QtWidgets.QComboBox()
-        self.sk_ground.addItems(["Auto-detect horizon", "No ground (all sky)", "Ground: bottom 20 %",
-                                 "Ground: bottom 30 %", "Ground: bottom 40 %", "Ground: bottom 50 %"])
-        self.sk_ground.setToolTip("The ground does not rotate with the stars, so it is stacked WITHOUT alignment "
-                                  "and blended with the sky along the horizon.")
         self.sk_hot = QtWidgets.QCheckBox("Remove hot pixels (recommended)"); self.sk_hot.setChecked(True)
-        self.sk_levels = QtWidgets.QCheckBox("Auto-brighten the result")
-        self.sk_levels.setToolTip("Stretches the levels so the stacked sky is easy to see.\nLeave off to keep the data untouched for editing.")
-        self.sk_fmt = QtWidgets.QComboBox(); self.sk_fmt.addItems([o[0] for o in TRAIL_OUTPUTS])
-        self.b_sky = QtWidgets.QPushButton("🌌  Stack the sky"); self.b_sky.setObjectName("primary")
-        self.b_sky.clicked.connect(self.run_sky_stack)
+        self.sk_unify = QtWidgets.QCheckBox("Unify exposure")
+        self.sk_unify.setToolTip("Matches every frame's brightness to the middle frame.\nUse when the light changes during the shoot (twilight, moon, auto exposure).")
+        kf.addRow("Method", self.sk_method); kf.addRow("", self.sk_hot); kf.addRow("", self.sk_unify)
+        kf.addRow(section("④ Composition"))
+        self.sk_lp = QtWidgets.QCheckBox("Reduce light pollution")
+        self.sk_stars = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sk_stars.setRange(0, 100); self.sk_stars.setValue(0)
+        self.sk_stars.setToolTip("Makes stars brighter without raising the sky background.")
+        self.sk_lp.setToolTip("Fits a smooth surface to the sky background (stars ignored) and subtracts it,\nremoving glow and gradients.")
+        self.sk_levels = QtWidgets.QCheckBox("Auto brightness")
+        self.sk_levels.setToolTip("Stretches the levels so the stacked sky is easy to see.\\nLeave off to keep the data untouched for editing.")
+        kf.addRow("", self.sk_lp); kf.addRow("Enhance star light", slider_row(self.sk_stars)); kf.addRow("", self.sk_levels)
+        kf.addRow(section("⑤ Calibration frames (optional)"))
         self.calib = {"dark": [], "flat": [], "bias": []}
 
         def calib_row(key, title, tip):
@@ -1589,20 +2063,20 @@ class MainWindow(QtWidgets.QMainWindow):
             row.addWidget(info, 1); row.addWidget(add); row.addWidget(clr)
             holder = QtWidgets.QWidget(); holder.setLayout(row)
             kf.addRow(title, holder)
-
-        kf.addRow("", self.sk_align); kf.addRow("Method", self.sk_method); kf.addRow("Ground", self.sk_ground)
-        kf.addRow("", self.sk_hot); kf.addRow("", self.sk_levels)
-        kf.addRow(note("Your LIGHT frames are the photos in the list on the left. Optional calibration frames "
-                       "(use the same camera settings as the lights):"))
-        calib_row("dark", "Dark frames", "Photos with the lens cap ON, same exposure, ISO and temperature as the sky photos.\n"
+        kf.addRow(note("Same camera settings as the lights."))
+        calib_row("dark", "Dark frames", "Lens cap ON, same exposure, ISO and temperature as the sky photos.\\n"
                                          "Removes hot pixels and amp glow.")
-        calib_row("flat", "Flat frames", "Photos of an evenly lit white surface at the same focus and aperture.\n"
+        calib_row("flat", "Flat frames", "An evenly lit white surface, same focus and aperture.\\n"
                                          "Removes vignetting and dust shadows. Use together with darks or bias.")
-        calib_row("bias", "Bias frames", "Fastest-shutter photos with the lens cap ON.\n"
+        calib_row("bias", "Bias frames", "Fastest-shutter photos with the lens cap ON.\\n"
                                          "Removes the sensor's readout offset (needed with flats).")
+        kf.addRow(section("Output"))
+        self.sk_fmt = QtWidgets.QComboBox(); self.sk_fmt.addItems([o[0] for o in TRAIL_OUTPUTS])
+        self.b_sky = QtWidgets.QPushButton("🌌  Stack the sky"); self.b_sky.setObjectName("primary")
+        self.b_sky.clicked.connect(self.run_sky_stack)
         kf.addRow("Save as", self.sk_fmt); kf.addRow(self.b_sky)
-        kf.addRow(note("Needs enough stars to match between photos. Uses more memory than trails (about 3 bytes of "
-                       "working memory per pixel per colour)."))
+        kf.addRow(note("Needs enough stars to match between photos, and uses a lot of memory (about 3 bytes per pixel "
+                       "per colour per processing step)."))
         tabs.addTab(scroll(sk), "🌌 Sky stack")
 
         create = QtWidgets.QGroupBox("2   Choose what to make")
@@ -1772,6 +2246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_tl.setEnabled(not busy)
         self.b_find.setEnabled(not busy)
         self.b_sky.setEnabled(not busy)
+        self.sk_edit.setEnabled(not busy)
 
     def set_meteor_actions(self, on):
         for b in (self.b_m_tick, self.b_m_export, self.b_m_pic, self.b_m_video):
@@ -1917,24 +2392,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib[key] = []
         label.setText("none")
 
+    def edit_sky_mask(self):
+        files = self.checked_files()
+        if len(files) < 3:
+            QtWidgets.QMessageBox.information(self, "Sky mask", "Add and tick at least 3 photos first.")
+            return
+        try:
+            prev = load_preview(files[len(files) // 2], max_side=1000)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Sky mask", f"Cannot open the photo: {e}")
+            return
+        h, w = prev.shape[:2]
+        init = self.sky_mask if (self.sky_mask is not None and self.sky_mask.shape == (h, w)) else np.ones((h, w), np.uint8)
+
+        def auto_fn():
+            am = auto_sky_mask(files)
+            return None if am is None else (cv2.resize(am, (w, h), interpolation=cv2.INTER_LINEAR) > 0.5).astype(np.uint8)
+        dlg = SkyMaskDialog(self, display_stretch(prev), init, auto_fn)
+        if dlg.exec():
+            self.sky_mask = dlg.result()
+            self.sk_region.setCurrentIndex(1)
+            self.sk_mask_lbl.setText(f"painted mask set ({int(100 * self.sky_mask.mean())}% sky)")
+
+    def add_calib(self, key, label):
+        pat = "Images (" + " ".join("*" + e for e in sorted(ALL_EXT)) + ")"
+        fs, _ = QtWidgets.QFileDialog.getOpenFileNames(self, f"Choose {key} frames", "", pat + ";;All files (*)")
+        files = [f for f in fs if is_supported(f)]
+        if files:
+            self.calib[key] = sorted(set(self.calib[key]) | set(files), key=natural_key)
+            label.setText(f"{len(self.calib[key])} frames")
+
+    def clear_calib(self, key, label):
+        self.calib[key] = []
+        label.setText("none")
+
     def run_sky_stack(self):
+        region = self.sk_region.currentIndex()
+        if region == 1 and self.sky_mask is None:
+            QtWidgets.QMessageBox.information(self, "Sky region", "Paint the sky first: click 'Edit sky mask…'.")
+            return
         _, ext, bits, flt = TRAIL_OUTPUTS[self.sk_fmt.currentIndex()]
         out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save stacked sky", "sky_stack" + ext, flt)
         if not out:
             return
         out = self.with_ext(out, ext)
-        ground = ["auto", None, 0.2, 0.3, 0.4, 0.5][self.sk_ground.currentIndex()]
+        ground = ["auto", "mask", 0.2, 0.3, 0.4, 0.5, None][region]
 
         def done(res):
             img, info = res
             save_uncompressed(out, img, bits)
-            self.show_image(img)
+            self.show_image(display_stretch(img).astype(np.uint16) << 8 if not self.sk_levels.isChecked() else img)
             self.mark_saved(out)
+            a = info["align"]
             msg = f"✔ Saved: {out} · aligned {info['aligned']}/{info['frames']} frames"
+            if info["align"]["order"]:
+                msg += f" · lens correction order {a['order']}"
+            if a["rms_median"] == a["rms_median"] and info["stars"]:
+                msg += f" · residual {a['rms_median']:.2f} px"
+            msg += f" · sky: {info['mask']} ({int(100 * info['sky_fraction'])}%)"
             if info["failed"]:
-                msg += f" ({len(info['failed'])} skipped: too few stars)"
-            if info["horizon"] is not None:
-                msg += f" · horizon at {int(info['horizon'] * 100)}% from the top"
+                msg += f" · skipped {len(info['failed'])} poor frame(s)"
             used = [f"{info[k]} {n}" for k, n in (("darks", "darks"), ("flats", "flats"), ("biases", "bias")) if info[k]]
             if used:
                 msg += " · calibrated with " + ", ".join(used)
@@ -1942,8 +2459,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg += " · tip: flats work best together with darks or bias"
             self.status.setText(msg)
         self.start(stack_sky, done, align=self.sk_align.isChecked(), reject=self.sk_method.currentIndex() == 1,
-                   ground=ground, hot_pixels=self.sk_hot.isChecked(), auto_levels=self.sk_levels.isChecked(),
-                   darks=self.calib["dark"] or None, flats=self.calib["flat"] or None, biases=self.calib["bias"] or None)
+                   ground=ground, sky_mask=self.sky_mask, hot_pixels=self.sk_hot.isChecked(),
+                   auto_levels=self.sk_levels.isChecked(), darks=self.calib["dark"] or None,
+                   flats=self.calib["flat"] or None, biases=self.calib["bias"] or None,
+                   distortion="off" if self.sk_dist.currentIndex() == 1 else "auto",
+                   feather=[0.004, 0.012, 0.03][self.sk_blend.currentIndex()], unify=self.sk_unify.isChecked(),
+                   reduce_lp=self.sk_lp.isChecked(), star_boost=self.sk_stars.value() / 100.0 * 3.0)
 
     def run_timelapse(self, with_meteors=False):
         if with_meteors and not self.meteor_events():
